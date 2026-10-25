@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Hardened build: no cleartext to any host. -->
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

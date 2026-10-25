@@ -1,0 +1,205 @@
+// The macOS app: the shared brain from :core, a Compose Desktop window, and
+// the Mac body (screen, voice, shell) as it is built up. Packaged with
+// `./gradlew :desktop:createDistributable` into
+// desktop/build/compose/binaries/main/app/Andee.app.
+import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+
+plugins {
+    id 'org.jetbrains.kotlin.jvm'
+    id 'org.jetbrains.compose'
+    // Required since Kotlin 2.0: the Compose compiler is no longer part of the
+    // Kotlin plugin.
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+kotlin {
+    jvmToolchain(17)
+}
+
+// Native helpers, compiled with the Command Line Tools' swiftc.
+//
+// The Mac this is built for: x86_64 (Intel) or arm64 (Apple Silicon). The Swift
+// bridge and the LWJGL natives must both match it, or the app fails to start
+// with "incompatible architecture". `os.arch` is 'x86_64' on Intel and
+// 'aarch64' on Apple Silicon.
+def osArch = System.getProperty('os.arch')
+def swiftTarget = (osArch == 'aarch64') ? 'arm64-apple-macos14' : 'x86_64-apple-macos14'
+// LWJGL's Intel macOS classifier is plain 'natives-macos' (no x64 suffix); only
+// arm64 gets the '-arm64' suffix.
+def lwjglNatives = (osArch == 'aarch64') ? 'natives-macos-arm64' : 'natives-macos'
+def nativeOut = layout.buildDirectory.dir('native')
+tasks.register('buildTrashTool', Exec) {
+    def src = file('native/trash.swift')
+    def out = nativeOut.get().file('andee-trash').asFile
+    inputs.file(src)
+    outputs.file(out)
+    doFirst { out.parentFile.mkdirs() }
+    commandLine 'swiftc', '-O', '-target', swiftTarget, src.path, '-o', out.path
+}
+// The bridge JNA loads: accessibility tree, input events, ScreenCaptureKit, workspace.
+tasks.register('buildBridge', Exec) {
+    def src = file('native/AndeeMac.swift')
+    def out = nativeOut.get().file('libandeemac.dylib').asFile
+    inputs.file(src)
+    outputs.file(out)
+    doFirst { out.parentFile.mkdirs() }
+    commandLine 'swiftc', '-O', '-target', swiftTarget, '-emit-library', '-framework', 'CoreDisplay', '-framework', 'CoreLocation', src.path, '-o', out.path
+}
+tasks.register('buildNative') { dependsOn('buildTrashTool', 'buildBridge') }
+sourceSets.main.resources.srcDir(nativeOut)
+processResources.dependsOn('buildNative')
+
+dependencies {
+    implementation project(':core')
+    implementation compose.desktop.currentOs
+    // Android has org.json built in; a JVM app has to bring it.
+    implementation 'org.json:json:20240303'
+    // Bonjour/mDNS on the JVM, for finding the phone on the LAN (the JDK has none). Pure Java, no native part.
+    implementation 'org.jmdns:jmdns:3.5.9'
+    // PeerServer extends its WebSocketServer, and core keeps that dependency to itself.
+    implementation 'org.java-websocket:Java-WebSocket:1.5.7'
+    // Drawing the pairing QR code the phone scans. Pure Java, encoder only.
+    implementation 'com.google.zxing:core:3.5.3'
+    // Calls into native/AndeeMac.swift.
+    implementation 'net.java.dev.jna:jna:5.14.0'
+    // LWJGL: OpenGL and CGL for the ball's offscreen renderer (no GLFW — see BallRenderer).
+    implementation 'org.lwjgl:lwjgl:3.3.4'
+    implementation 'org.lwjgl:lwjgl-opengl:3.3.4'
+    implementation "org.lwjgl:lwjgl:3.3.4:${lwjglNatives}"
+    implementation "org.lwjgl:lwjgl-opengl:3.3.4:${lwjglNatives}"
+
+    testImplementation libs.junit
+}
+
+compose.desktop {
+    application {
+        mainClass = 'net.kuafuai.andee.desktop.MainKt'
+        nativeDistributions {
+            targetFormats(TargetFormat.Dmg)
+            packageName = 'Andee'
+            // The packaged runtime is trimmed to what jlink sees used; LWJGL (the
+            // ball's OpenGL) reaches sun.misc.Unsafe reflectively, so name it, or the
+            // ball silently fails only in the .app and never under `gradle run`.
+            modules('jdk.unsupported')
+            // macOS rejects a 0.x bundle version for a .dmg; 1.0.0 is the bundle's
+            // version, not the product's.
+            packageVersion = '1.0.0'
+            macOS {
+                // The phone's launcher character on a white tile, as an .icns (icon/Andee.icns).
+                iconFile.set(project.file('icon/Andee.icns'))
+                bundleID = 'net.kuafuai.andee.mac'
+                entitlementsFile.set(project.file('entitlements.plist'))
+                runtimeEntitlementsFile.set(project.file('entitlements.plist'))
+                // macOS shows these when Andee first asks; without them the request is refused silently.
+                infoPlist {
+                    extraKeysRawXml = '''
+                        <key>NSMicrophoneUsageDescription</key>
+                        <string>Andee listens when you press the microphone button, to hear what you ask.</string>
+                        <key>NSAppleEventsUsageDescription</key>
+                        <string>Andee uses Calendar, Reminders, Contacts and other apps when you ask it to.</string>
+                        <key>NSCalendarsUsageDescription</key>
+                        <string>Andee reads and adds calendar events when you ask it to.</string>
+                        <key>NSRemindersUsageDescription</key>
+                        <string>Andee sets reminders when you ask it to.</string>
+                        <key>NSContactsUsageDescription</key>
+                        <string>Andee looks up contacts when you ask it to.</string>
+                        <key>NSCameraUsageDescription</key>
+                        <string>Andee looks through the camera only when you ask it to.</string>
+                        <key>NSLocationUsageDescription</key>
+                        <string>Andee reads this Mac's location only when you ask where it is.</string>
+                    '''
+                }
+            }
+        }
+    }
+}
+
+// A turn without the window, for checking the brain on this Mac:
+//   ./gradlew :desktop:probe --args='记住我喜欢芒果'
+tasks.register('probe', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'net.kuafuai.andee.desktop.ProbeKt'
+    standardInput = System.in
+}
+
+tasks.named('test') {
+    dependsOn('buildNative')
+    systemProperty 'andee.trashTool', layout.buildDirectory.file('native/andee-trash').get().asFile.path
+}
+
+// One frame of the ball to a PNG, to check the desktop renderer without the window:
+//   ./gradlew :desktop:ballshot --args='HAPPY 336 /tmp/ball.png andee'
+tasks.register('ballshot', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'net.kuafuai.andee.desktop.BallShotKt'
+}
+
+// One fixed signing identity, so macOS keeps Accessibility and Screen Recording
+// across rebuilds: an ad-hoc signature is a new app every build, and every grant
+// silently lapses. Signed here with codesign rather than through Compose's own
+// signing, which only accepts Apple "Developer ID Application" names.
+//
+// The identity is the packager's alone (see desktop/README-signing.md); users of
+// the built app never need it. Without it the app stays ad-hoc and still builds.
+def signIdentity = providers.gradleProperty('andee.signing.identity').orElse('Andee Local Signing')
+def signKeychain = providers.gradleProperty('andee.signing.keychain')
+    .orElse("${System.getProperty('user.home')}/Library/Keychains/andee-signing.keychain-db")
+def signPasswordFile = file("${System.getProperty('user.home')}/Andee-signing/keychain-password")
+
+tasks.register('signApp') {
+    def app = layout.buildDirectory.dir('compose/binaries/main/app/Andee.app')
+    def entitlements = file('entitlements.plist')
+    onlyIf { file(signKeychain.get()).exists() }
+    doLast {
+        def kc = signKeychain.get()
+        if (signPasswordFile.exists()) {
+            exec { commandLine 'security', 'unlock-keychain', '-p', signPasswordFile.text.trim(), kc }
+        }
+        exec {
+            commandLine 'codesign', '--force', '--deep', '--options', 'runtime', '--timestamp=none',
+                '--entitlements', entitlements.path, '--keychain', kc,
+                '--sign', signIdentity.get(), app.get().asFile.path
+        }
+        exec { commandLine 'codesign', '--verify', '--deep', '--strict', app.get().asFile.path }
+        logger.lifecycle("Andee.app signed as '${signIdentity.get()}'")
+    }
+}
+// Render at 1x instead of 2x, for a machine that has to draw the window on the CPU
+// (-Dandee.software=true): at 2x a 1280x909-point window is 2560x1818 pixels of Skia
+// work per frame, at 1x a quarter of that.
+//
+// Opt in with -PoneX, and not by default: measured on this Mac, 1x bought no reliable
+// saving (670/694 ms vs 681/372 ms of UI-thread raster per 5 s — the upscale moves to
+// the WindowServer, which is outside this process), and it costs sharpness, since the
+// display then stretches a half-resolution image over the same area. A smaller window
+// buys the same pixels back without that trade (see defaultChatSize).
+tasks.register('patchInfoPlist') {
+    def app = layout.buildDirectory.dir('compose/binaries/main/app/Andee.app')
+    def oneX = project.hasProperty('oneX')
+    onlyIf { oneX && osArch != 'aarch64' && app.get().asFile.exists() }
+    doLast {
+        def plist = "${app.get().asFile.path}/Contents/Info.plist"
+        exec {
+            // plutil, not PlistBuddy: PlistBuddy writes the value as the *string*
+            // "false", and AppKit reads any non-nil value as true, so the key looks
+            // right in the plist and does nothing. It has to be a real bool.
+            // '-replace' throws if the key is missing; then insert it instead.
+            commandLine 'sh', '-c',
+                "/usr/bin/plutil -replace NSHighResolutionCapable -bool false '$plist' || " +
+                "/usr/bin/plutil -insert NSHighResolutionCapable -bool false '$plist'"
+        }
+        logger.lifecycle('Andee.app renders at 1x (NSHighResolutionCapable=false)')
+    }
+}
+tasks.matching { it.name == 'createDistributable' }.configureEach { finalizedBy('patchInfoPlist') }
+// Signing seals the bundle, so it has to come after the plist is changed.
+tasks.named('signApp') { dependsOn('patchInfoPlist') }
+tasks.matching { it.name == 'createDistributable' }.configureEach { finalizedBy('signApp') }
+
+// The real window body, drawn offscreen against seeded throwaway data:
+//   ./gradlew :desktop:uishot --args='chat 1020 820 /tmp/ui.png'
+tasks.register('uishot', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'net.kuafuai.andee.desktop.UiShotKt'
+    jvmArgs '-Dapple.awt.UIElement=true'
+}
